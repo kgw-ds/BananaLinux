@@ -545,6 +545,11 @@ namespace banana
 			add(BD, "nds", "Frame pacing", "How DS frames line up with the screens.",
 				bds, "kms.pace", { "Panels", "DS rate" }, { "display", "ds" });
 			items.back().hints = { "A new frame every screen refresh: the smoothest. Games run 0.3% fast, the sound matched.", "The DS's own speed. A frame shows twice about every 6 seconds." };
+			// BananaDS's kms.ff_music (its docs/SETTINGS.md, melonDS patch 0500): the sound on a clock of its own while
+			// fast-forwarding; off: kms.ff_mute's fade-out, as before
+			add(BD, "nds", "Fast-forward sound", "What you hear while a game is fast-forwarded. DS games only.",
+				bds, "kms.ff_music", { "Normal speed", "Silent" }, { "on", "off" });
+			items.back().hints = { "The game runs fast, its music and sounds play at their own speed and pitch. A wait for a sound (a cry, a fanfare) isn't sped up.", "The game's sound fades out until fast-forward ends." };
 			// experimental: BananaDS's kms.lowlat (its docs/SETTINGS.md): no queue, frames aimed at the vblank
 			// (run-ahead left out in 0.5.0: it never fit a refresh on these handhelds, agent-qa LL2; run-bananads turns a card's into on)
 			add(BD, "nds", "Low latency (experimental)", "How soon a press shows on the screens. Experimental.",
@@ -926,7 +931,7 @@ namespace banana
 			{ "Sleep & power", { "Sleep when idle", "Closing the lid", "Dim when idle", "Power off after sleeping", "LEDs", "Waking up" } },
 			{ "System", { "Updates", "Language", "Time zone", "Box art", "Hotkeys", "About", "Credits", "First-time setup", "Reset system settings", "Reset emulator settings" } },
 			{ "SuperDrastic", { "Shader", "3D resolution", "CPU clock", "Frame pacing", "Threaded 3D", "Microphone", "Low latency (experimental)", "Hotkeys", "Reset buttons", "Reset DraStic" } },
-			{ "BananaDS", { "Shader", "3D resolution", "CPU clock", "Frame pacing", "Timing", "DS CPU speed", "Microphone", "Mic sensitivity", "Edge marking", "Fog", "Low latency (experimental)", "Hotkeys", "Reset BananaDS" } },
+			{ "BananaDS", { "Shader", "3D resolution", "CPU clock", "Frame pacing", "Timing", "DS CPU speed", "Microphone", "Mic sensitivity", "Edge marking", "Fog", "Fast-forward sound", "Low latency (experimental)", "Hotkeys", "Reset BananaDS" } },
 			{ "Picture & sound", { "Shader", "Screen border", "VSync", "Audio latency" } },
 			{ "Menu look", { "Clock", "Battery", "DS cartridges", "Motion", "Boot animation" } },
 		};

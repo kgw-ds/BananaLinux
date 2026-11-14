@@ -1,0 +1,577 @@
+From 8ecbbbfa80f222f40cd36c5dff8e24049fa666b0 Mon Sep 17 00:00:00 2001
+From: kgw-ds <kgw-ds@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:49:16 +0900
+Subject: [PATCH] BananaDS: kms.ff_music, the music at its own speed while
+ fast-forwarding
+
+While fast-forwarding, the game runs N times as fast and its music and
+sound effects keep their own tempo and pitch instead of fading out
+(kms.ff_mute) or playing sped up.
+
+- melonDS patch 0500: a sound clock. The ARM7's timers (the SDK's sound
+  alarm steps the sequencer on them) and the SPU run at a rate of the
+  game's time; exact under FastTimers and FastMix; 1.0 is melonDS's
+  paths; a DSi stays at 1.0.
+- ffmusic.h: each frame, the rate is 1 / the speed the game reaches
+  (frame times against the pacer's period, so Max and a slow game are
+  followed), nudged by the sound thread's backlog against
+  audio.servo_target. Host tests in tests.cpp.
+- frontend_kms: kms.ff_music (on) sets the clock while fast-forwarding
+  and leaves the sound unmuted; off, kms.ff_mute as before.
+- Emu::set_sound_clock, core.sound_clock (a fixed rate, for the tests).
+- CI: FastTimers and FastMix at scaled clocks against their slow paths
+  (dsreal, sndbench; x86 and aarch64 qemu), the clock changes the game's
+  state, and half the clock makes half the sound.
+---
+ bananads/docs/SETTINGS.md                     |   3 +
+ ...-its-own-speed-while-fast-forwarding.patch | 222 ++++++++++++++++++
+ bananads/src/alsa.cpp                         |   2 +
+ bananads/src/emu.cpp                          |  12 +
+ bananads/src/emu.h                            |   5 +
+ bananads/src/ffmusic.h                        |  56 +++++
+ bananads/src/frontend.h                       |   2 +
+ bananads/src/frontend_kms.cpp                 |  21 +-
+ bananads/tests/tests.cpp                      |  59 +++++
+ 9 files changed, 380 insertions(+), 2 deletions(-)
+ create mode 100644 bananads/patches/melonds/0500-NDS-SPU-a-sound-clock-the-music-at-its-own-speed-while-fast-forwarding.patch
+ create mode 100644 bananads/src/ffmusic.h
+
+diff --git a/bananads/docs/SETTINGS.md b/bananads/docs/SETTINGS.md
+index b7b7f3a..f3247fd 100644
+--- a/bananads/docs/SETTINGS.md
++++ b/bananads/docs/SETTINGS.md
+@@ -52,6 +52,7 @@ key can also come from the environment as `BANANADS_<KEY>` (dots become undersco
+ | `core.fast_sched` | `on` | the scheduler keeps the time of its next event instead of walking its event list twice every slice (patches/melonds/0006, 0009). Exact; on since `core.fast_loop` needs it |
+ | `core.halt_skip` | `on` | while both CPUs are halted with nothing to wake them (no IRQ pending, no DMA, the geometry engine idle), the slice loop takes the times straight to the last slice end before the next event or timer, instead of 64 cycles at a time (patches/melonds/0031; with `core.fast_loop`). Exact. `MELONDS_HALTSKIP_STATS=1` logs how often it skipped |
+ | `core.fast_timers` | `on` | a CPU's timers run only when one of them overflows, not every slice (patches/melonds/0009). Exact |
++| `core.sound_clock` | `1` | for tests: the sound clock's rate from the start (1/64 to 1; patches/melonds/0500): the ARM7's four timers and the SPU run at this fraction of the game's time. `kms.ff_music` sets it itself while fast-forwarding. `1`: the hardware, melonDS's code paths. A DSi stays at 1 |
+ | `core.fast_loop` | `on` | the scheduler's slice loop for the JIT with the common cases inline: block lookup and dispatch, a halted CPU, an idle 3D engine, a slice with no event due (patches/melonds/0009). Exact; used with `core.fast_sched` |
+ | `render.geom_batch` | `on` | with `render.geom_fast`, the geometry engine does the GX FIFO's DMA and IRQ checks once per run (after its commands) instead of after every refill of its 4-entry pipe, while no CPU write is stalled (patches/melonds/0050). Exact (nothing a command does reads IF or the DMAs; with the stall queue empty the FIFO's level only falls, so the last check decides). `MELONDS_GEOMBATCH=0` turns it off |
+ | `render.gx_dmafast` | `on` | a DMA from main RAM into the GX FIFO port (the GX FIFO DMA, mode 7, as Mario Kart DS sends its display lists; `core.dma_block`'s block path) unpacks its words into the FIFO with the command state, the FIFO's level and its write position in registers, and sets GXSTAT's bits once per block (patches/melonds/0060); its burst timing keeps the target and the burst table in registers (0062). Exact (same entries, order, FIFO and pipe contents; an entry into an empty or full FIFO takes the old path). `MELONDS_GXDMAFAST=0` turns it off. |
+@@ -153,6 +154,8 @@ key can also come from the environment as `BANANADS_<KEY>` (dots become undersco
+ | `kms.touch` | `$BANANADS_TOUCH`, else `fe5e0000.i2c` | the bottom panel's touchscreen: the input device whose sysfs path contains this |
+ | `kms.menu` | `on` | the in-game menu (src/menu.c: SuperDrastic's, in BananaOS's colours): F or HOME (and a button set to `menu`, `input.<button>`) pauses the game and opens it on both panels. Resume, Save and Load (8 slots with pictures; a load can be undone), Quick settings (volume, brightness, the microphone's meter and a blow), Restart game, Quit game. `kms.menu_test=<n>` opens it 3 s in, on the main page (1), Save (2), Load (3), Quick settings (4) or the quit question (5), for tests |
+ | `input.<button>` | as the pad is printed; `input.l2` `swap`, `input.r2` `ff`, `input.l3` `blow`, `input.r3` `none` (the RG DS Plus has no R3) | what a button of the pad does in a game. `<button>`: `a` `b` `x` `y` `l` `r` `start` `select` `up` `down` `left` `right` `l2` `r2` `l3` `r3`. The value: one of the DS's buttons (`a` `b` `x` `y` `l` `r` `start` `select` `up` `down` `left` `right`; two buttons can be the same DS button) or a job: `menu` (the in-game menu, on release), `swap` (the screens, as F + SELECT, remembered for the game), `save` / `load` (slot 1, as F + R / F + L), `ff` (fast-forward on and off, as F + X), `ffhold` (fast-forward while held), `screenshot`, `blow` (the game hears a blow on the mic while it's held, the menu's Blow, the mic on or off), `none`. A keyboard's keys follow the button they stand for. F + a button, HOME and the menu's own keys never change, so no setting leaves you without the menu. A value it doesn't know is logged and the button keeps its own |
++| `kms.ff_music` | `on` | while fast-forwarding (R2, F + X, the in-game menu's Fast-forward), the music and the sound effects keep their own tempo and pitch: the ARM7's timers (the SDK's sound alarm, which steps the sequencer) and the SPU run on a sound clock at 1/N of the game's time, N the speed the game reaches (measured each frame; Max follows what the handheld manages), nudged by the sound's backlog against `audio.servo_target` (src/ffmusic.h, patches/melonds/0500). The game runs N times as fast; where it waits for a sound to end (a cry, a fanfare) that wait takes real time. A game whose ARM7 times other things on its timers (not the SDK's sound system) may misbehave while fast-forwarding: `off` then. Touch and the microphone are sampled on the ARM7 too and may answer more slowly while it's on. A DS only: a DSi game fades out as before. `off`: `kms.ff_mute` decides |
++| `kms.ff_mute` | `on` | with `kms.ff_music=off`: the game's sound faded out while fast-forwarding (sped-up sound is chopped). `off`: it plays sped up |
+ | `kms.lowlat` | `off` | **Experimental.** `on`: low latency. Each frame is aimed at a vblank: the emulator's thread starts it as late as its measured time allows (its own work and the presenter's 2D wait and shader pass, each a decaying maximum, plus `kms.lowlat_pad_us`, plus up to 16 ms more after frames that showed late; never the time a frame waited for the panels), so the buttons are read as late as possible. Frames are held to their own vblank's window (never shown a refresh early) and up to three may wait, so a game slower than a refresh starts the next frame early instead of stuttering; the next frame always aims at the refresh after the last waiting one. Measured in 0.5.0 (agent-qa/LL2.md): 15-21 ms from a frame's start to the panels instead of 48-60, 0-3 repeats a minute in a Mario Kart DS race (single frames of 20-60 ms can't be hidden without buffering). cpugov uses a tighter step-down rule (`cpugov.tail` 0.8) and its own memory (`<rom>.<scale>.lowlat`). The game runs at the panels' rate (as `kms.pace=display`). `kms.lowlat_trace=<file>` writes each frame's times at the quit (also without `kms.lowlat`). `runahead1` / `runahead2`: that and run-ahead (`runahead`). A `[lowlat]` log line every 10 s |
+ | `kms.lowlat_margin_us` | `1500` | with `kms.lowlat`: the deadline, this long before the earlier panel's vblank; +300 per commit that missed its vblank (at most 5000), back down after a clean 10 s |
+ | `kms.lowlat_pad_us` | `1000` | with `kms.lowlat`: added to the frames' measured time when a frame is started |
+diff --git a/bananads/patches/melonds/0500-NDS-SPU-a-sound-clock-the-music-at-its-own-speed-while-fast-forwarding.patch b/bananads/patches/melonds/0500-NDS-SPU-a-sound-clock-the-music-at-its-own-speed-while-fast-forwarding.patch
+new file mode 100644
+index 0000000..20cbf2f
+--- /dev/null
++++ b/bananads/patches/melonds/0500-NDS-SPU-a-sound-clock-the-music-at-its-own-speed-while-fast-forwarding.patch
+@@ -0,0 +1,222 @@
++From 77aabcc9a1c271cfa687007cbac2fcfaa2347b2e Mon Sep 17 00:00:00 2001
++From: kgw-ds <kgw-ds@users.noreply.github.com>
++Date: Sat, 14 Nov 2026 17:42:16 +0900
++Subject: [PATCH] NDS, SPU: a sound clock, the music at its own speed while
++ fast-forwarding
++
++NDS::SetSoundClockRate(rate): the ARM7's four timers and the SPU run at
++rate of emulated time while everything else keeps the console's clock.
++DS games play their music on the ARM7: a periodic alarm on its timers
++steps the SDK's sequencer and the SPU plays the notes. Fast-forwarded N
++times with rate 1/N, music and sound effects keep their own tempo and
++pitch. The idea is Ssncdevelop/melonDS's keep-music-speed (melonDS 1.1,
++GPL-3.0-or-later), ported onto BananaDS's FastTimers and FastMix.
++
++- RunTimer: an ARM7 timer counts (cycles << CycleShift) * rate, its
++  16.16 remainder kept per timer, so runs of any length add up to the
++  same count. FastTimers' TimerNextUpdate takes the fewest cycles whose
++  scaled count reaches the overflow: exact, as before.
++- SPU::Mix: a Mix runs round(its cycles * rate) SPU cycles for the
++  channels, the capture units, the microphone and the output timeline,
++  the same count every Mix, so FastMix keeps skipping (MixChannelsFast
++  already brings its skipped channels up to date when the count
++  changes). Mixes still come every MixInterval system cycles.
++- The rate is quantized to whole SPU cycles per Mix and the timers take
++  that rate, so the sequencer and the SPU keep one clock.
++- 1.0 is the hardware and the code paths are melonDS's (one untaken
++  branch). A DSi stays at 1.0: its DSP sound isn't on this clock.
++---
++ src/NDS.cpp | 46 ++++++++++++++++++++++++++++++++++++++++++++--
++ src/NDS.h   | 10 ++++++++++
++ src/SPU.cpp | 28 ++++++++++++++++++++++++++++
++ src/SPU.h   |  8 ++++++++
++ 4 files changed, 90 insertions(+), 2 deletions(-)
++
++diff --git a/src/NDS.cpp b/src/NDS.cpp
++index e0ba3ab..51cb19c 100644
++--- a/src/NDS.cpp
+++++ b/src/NDS.cpp
++@@ -20,6 +20,7 @@
++ #include <stdio.h>
++ #include <string.h>
++ #include <inttypes.h>
+++#include <algorithm>
++ #include "NDS.h"
++ #include "ARMJIT_Stats.h"
++ #include "ARM.h"
++@@ -558,6 +559,7 @@ void NDS::Reset()
++     TimerNext[0] = 0;
++     TimerNext[1] = 0;
++     TimerNextMin = 0;
+++    for (u32& frac : SoundClockFrac) frac = 0; // (the rate is the frontend's and stays)
++ 
++     for (i = 0; i < 8; i++) DMAs[i].Reset();
++     memset(DMA9Fill, 0, 4*4);
++@@ -2506,7 +2508,16 @@ void NDS::RunTimer(u32 tid, s32 cycles)
++ {
++     Timer* timer = &Timers[tid];
++ 
++-    timer->Counter += (cycles << timer->CycleShift);
+++    if (tid >= 4 && SoundClockRate != 0x10000) [[unlikely]]
+++    {
+++        // sound clock (SetSoundClockRate): an ARM7 timer counts rate x its cycles, the remainder kept for the next
+++        // run, so runs of any lengths add up to the same count (FastTimers' catch-ups included)
+++        const u64 scaled = ((u64)(u32)cycles << timer->CycleShift) * SoundClockRate + SoundClockFrac[tid - 4];
+++        timer->Counter += (u32)(scaled >> 16);
+++        SoundClockFrac[tid - 4] = (u32)scaled & 0xFFFF;
+++    }
+++    else
+++        timer->Counter += (cycles << timer->CycleShift);
++     while (timer->Counter >> 26)
++     {
++         timer->Counter -= (1 << 26);
++@@ -2550,7 +2561,19 @@ void NDS::TimerNextUpdate(u32 cpu) noexcept
++         const Timer& timer = Timers[(cpu << 2) + i];
++         u64 due = base;
++         if (timer.Counter < (1u << 26))
++-            due += (((1u << 26) - timer.Counter) + (1u << timer.CycleShift) - 1) >> timer.CycleShift;
+++        {
+++            const u32 need = (1u << 26) - timer.Counter;
+++            if (cpu == 1 && SoundClockRate != 0x10000) [[unlikely]]
+++            {
+++                // sound clock: the fewest cycles c whose scaled count, ((c << CycleShift) * rate + remainder) >> 16
+++                // as RunTimer adds it, reaches need
+++                const u64 num = ((u64)need << 16) - SoundClockFrac[i];
+++                const u64 den = (u64)SoundClockRate << timer.CycleShift;
+++                due += (num + den - 1) / den;
+++            }
+++            else
+++                due += (need + (1u << timer.CycleShift) - 1) >> timer.CycleShift;
+++        }
++         if (due < next)
++             next = due;
++     }
++@@ -2558,6 +2581,25 @@ void NDS::TimerNextUpdate(u32 cpu) noexcept
++     TimerNextMin = std::min(TimerNext[0], TimerNext[1]);
++ }
++ 
+++double NDS::SetSoundClockRate(double rate)
+++{
+++    u32 fixed = 0x10000;
+++    if (ConsoleType == 0 && rate < 1.0)
+++        fixed = (u32)std::clamp(rate * 65536.0 + 0.5, 1024.0, 65536.0);
+++    // whole SPU cycles per Mix (so FastMix keeps skipping); the timers take the same rate
+++    fixed = SPU.SetClockRate(fixed);
+++    if (fixed != SoundClockRate)
+++    {
+++        RunTimers(1); // the ARM7's timers up to now at the old rate
+++        SoundClockRate = fixed;
+++        if (fixed == 0x10000)
+++            for (u32& frac : SoundClockFrac) frac = 0;
+++        if (FastTimers)
+++            TimerNextUpdate(1);
+++    }
+++    return SoundClockRate / 65536.0;
+++}
+++
++ const s32 TimerPrescaler[4] = {0, 6, 8, 10};
++ 
++ u16 NDS::TimerGetCounter(u32 timer)
++diff --git a/src/NDS.h b/src/NDS.h
++index ad66436..a1f17df 100644
++--- a/src/NDS.h
+++++ b/src/NDS.h
++@@ -300,6 +300,14 @@ public: // TODO: Encapsulate the rest of these members
++     // earliest overflow of its counting timers (RunTimer is additive, so the counters catch up then; every read of a
++     // counter goes through RunTimers first). Off: TimerNext stays 0, and the timers run every slice as melonDS's.
++     void SetFastTimers(bool on) noexcept { FastTimers = on; TimerNext[0] = TimerNext[1] = TimerNextMin = 0; }
+++    // Sound clock (BananaDS, kms.ff_music): the ARM7's four timers (they drive the SDK's sound alarm, and so the
+++    // sequencer) and the SPU (channels, capture, the microphone's clock, the output's timeline) run at `rate` of
+++    // emulated time; everything else keeps the console's clock. Fast-forwarded N times with rate 1/N, a game's music
+++    // and sound effects keep their own tempo and pitch. 1.0 is the hardware (the code paths are melonDS's then).
+++    // From 1/64 to 1, quantized to whole SPU cycles per Mix so the timers and the SPU keep one clock; a DS only (a
+++    // DSi's DSP sound isn't on this clock: 1.0 there). Returns the rate in effect. Between frames, emulator thread.
+++    double SetSoundClockRate(double rate);
+++    double GetSoundClockRate() const noexcept { return SoundClockRate / 65536.0; }
++     // FastLoop (exact, BananaDS; needs FastSched): RunFrame's loop for the JIT with NextTarget, RunSystem's
++     // early-out, GPU3D::Run's idle case, a halted CPU and Execute's block loop inline (RunSlicesJIT).
++     void SetFastLoop(bool on) noexcept { FastLoop = on; SliceChainOK = FastLoop && FastSched; }
++@@ -821,6 +829,8 @@ protected:
++     u64 TimerNext[2] = {0, 0}; // RunFrame skips RunTimers(cpu) while the CPU's time is below this (FastTimers)
++     u64 TimerNextMin = 0; // the lower of the two
++     void TimerNextUpdate(u32 cpu) noexcept;
+++    u32 SoundClockRate = 0x10000; // SetSoundClockRate's rate, 16.16 (0x10000: the hardware)
+++    u32 SoundClockFrac[4] = {};   // each ARM7 timer's remainder of its scaled count (16.16's fraction)
++     bool FastLoop = false;
++     bool HaltSkip = false;
++     bool SliceChainOK = false; // FastLoop && FastSched: RunSlicesJIT is the loop SliceChain9 stands in for
++diff --git a/src/SPU.cpp b/src/SPU.cpp
++index fa9a130..b2e3015 100644
++--- a/src/SPU.cpp
+++++ b/src/SPU.cpp
++@@ -326,6 +326,22 @@ void SPU::SetSampleRate(AudioSampleRate rate)
++     memset(OutputLastSamples, 0, sizeof(OutputLastSamples));
++     FastDirty = true;
++     FastTailValid = false;
+++    ClockIn = ~0u; // (the sound clock's count per Mix, made again for the new length)
+++}
+++
+++u32 SPU::SetClockRate(u32 rate)
+++{
+++    // the count per Mix (MixInterval system cycles are MixInterval / 2 SPU cycles), at least 1, and the rate it is
+++    const u32 len = MixInterval >> 1;
+++    u32 count = len ? (u32)(((u64)len * rate + 0x8000) >> 16) : len;
+++    if (count < 1) count = 1;
+++    const u32 eff = (rate >= 0x10000 || count >= len) ? 0x10000 : (u32)((((u64)count << 16) + len / 2) / len);
+++    if (eff != ClockRate)
+++    {
+++        ClockRate = eff;
+++        ClockIn = ~0u;
+++    }
+++    return ClockRate;
++ }
++ 
++ 
++@@ -1223,6 +1239,18 @@ bool SPU::MixChannelsFast(u32 spucycles, s32& left, s32& right, s32& ch1, s32& c
++ 
++ void SPU::Mix(u32 spucycles)
++ {
+++    // sound clock (SetClockRate): this Mix runs fewer SPU cycles, and everything below takes that count (a change of
+++    // count is one MixChannelsFast already handles: it brings the skipped channels up to date first)
+++    if (ClockRate != 0x10000) [[unlikely]]
+++    {
+++        if (spucycles != ClockIn)
+++        {
+++            ClockIn = spucycles;
+++            ClockOut = spucycles ? std::max<u32>(1, (u32)(((u64)spucycles * ClockRate + 0x8000) >> 16)) : 0;
+++        }
+++        spucycles = ClockOut;
+++    }
+++
++     s32 left = 0, right = 0;
++     s32 leftoutput = 0, rightoutput = 0;
++     s32 ch1 = 0, ch3 = 0;
++diff --git a/src/SPU.h b/src/SPU.h
++index 6553b61..557201d 100644
++--- a/src/SPU.h
+++++ b/src/SPU.h
++@@ -256,6 +256,12 @@ public:
++ 
++     void Mix(u32 spucycles);
++ 
+++    // Sound clock (BananaDS, NDS::SetSoundClockRate): a Mix runs round(its cycles x rate) SPU cycles (16.16, 0x10000:
+++    // the hardware) for the channels, the capture units, the microphone and the output, the same count every Mix so
+++    // FastMix keeps skipping. Mixes still come every MixInterval system cycles. Returns the rate in effect: the
+++    // count per Mix over the Mix's cycles (1.0 when the count would be the whole Mix).
+++    u32 SetClockRate(u32 rate);
+++
++     // FastMix (BananaDS, exact): channels whose output can't have changed since the last Mix aren't run again,
++     // the mixers sum with NEON, sound DMA and capture access main RAM directly. Off by default.
++     void SetFastMix(bool enable);
++@@ -306,6 +312,8 @@ private:
++     s16 OutputLastSamples[2];
++ 
++     u32 MixInterval;
+++    u32 ClockRate = 0x10000;     // SetClockRate's rate in effect (16.16)
+++    u32 ClockIn = 0, ClockOut = 0; // the last Mix length scaled, and its scaled count
++ 
++     Platform::Mutex* AudioLock;
++ 
++-- 
++2.49.0.windows.1
++
+diff --git a/bananads/src/alsa.cpp b/bananads/src/alsa.cpp
+index 06f0d47..2a2d4d2 100644
+--- a/bananads/src/alsa.cpp
++++ b/bananads/src/alsa.cpp
+@@ -415,6 +415,8 @@ Alsa* alsa_start(Emu& emu, const Config& cfg) {
+     return a;
+ }
+ 
++int alsa_servo_target(const Alsa* a) { return a && a->servo ? a->servo_target : 0; }
++
+ void alsa_mute(Alsa* a, bool on) {
+     if (!a || a->mute.exchange(on) == on) return;
+     Log(LogLevel::Info, "[alsa] game sound %s\n", on ? "faded out (fast-forward)" : "back");
+diff --git a/bananads/src/emu.cpp b/bananads/src/emu.cpp
+index 41b372f..63b95b4 100644
+--- a/bananads/src/emu.cpp
++++ b/bananads/src/emu.cpp
+@@ -8,8 +8,10 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <ctime>
+ #include <fstream>
+@@ -1151,6 +1153,10 @@ bool Emu::load_rom(const std::string& path) {
+     // the JIT with the common cases inline, used with core.fast_sched (patch 0009; both exact, default on)
+     nds_->SetFastTimers(cfg_.flag("core.fast_timers", true));
+     nds_->SetFastLoop(cfg_.flag("core.fast_loop", true));
++    // the sound clock (melonDS patch 0500; kms.ff_music sets it while fast-forwarding): the rate asked for last, or
++    // core.sound_clock (for the tests: a fixed rate from the start, 1 = the hardware) before anything asked
++    if (sound_clock_ < 0) sound_clock_ = std::clamp(atof(cfg_.str("core.sound_clock", "1").c_str()), 1.0 / 64, 1.0);
++    sound_clock_ = nds_->SetSoundClockRate(sound_clock_);
+     // core.halt_skip: with both CPUs halted and nothing to wake them, the slice loop takes the times straight to the
+     // next event or timer instead of slice by slice (melonDS patch 0031; exact, default on; with core.fast_loop)
+     nds_->SetHaltSkip(cfg_.flag("core.halt_skip", true));
+@@ -1597,6 +1603,12 @@ void Emu::set_audio_rate(double hz) {
+     if (nds_) nds_->SPU.SetOutputSampleRate(hz);
+ }
+ 
++double Emu::set_sound_clock(double rate) {
++    if (!(rate > 0)) rate = 1.0;  // (NaN too)
++    sound_clock_ = nds_ ? nds_->SetSoundClockRate(rate) : std::clamp(rate, 1.0 / 64, 1.0);
++    return sound_clock_;
++}
++
+ int Emu::audio_backlog() const { return nds_->SPU.GetOutputSize(); }
+ 
+ int Emu::audio(int16_t* stereo, int max_frames) {
+diff --git a/bananads/src/emu.h b/bananads/src/emu.h
+index 01f2208..bc86f9e 100644
+--- a/bananads/src/emu.h
++++ b/bananads/src/emu.h
+@@ -98,6 +98,10 @@ public:
+     int audio(int16_t* stereo, int max_frames);  // what the SPU made since the last call
+     void set_audio_rate(double hz);              // the SPU's output rate (48000: the DS's speed; kms.pace=display)
+     int audio_backlog() const;                   // what the SPU made and audio() hasn't read yet, in stereo frames
++    // the sound clock (melonDS patch 0500, kms.ff_music): the ARM7's timers and the SPU at `rate` of the game's time
++    // (1/N fast-forwarded N times: the music keeps its tempo and pitch; 1: the hardware). Between frames, emulator's
++    // thread; kept for a console made again (restart). Returns the rate in effect: 1 on a DSi, which isn't on it
++    double set_sound_clock(double rate);
+     // the sound's speed against the game's (audio.servo): below 1 stretches it (more samples per emulated second);
+     // any thread may ask, the emulator's thread applies it between frames (never inside the SPU's mix)
+     void set_audio_skew(double s) { skew_req_.store(s, std::memory_order_relaxed); }
+@@ -174,6 +178,7 @@ private:
+     bool lid_closed_ = false;  // the lid as set_lid last had it (emulator thread)
+     uint32_t bank3d_ = 0;
+     double skew_cur_ = 1.0;
++    double sound_clock_ = -1;  // set_sound_clock's rate (-1: none asked yet, core.sound_clock's at the setup)
+     std::vector<int16_t> tap_;  // audio.tap: the mixer's 32768 Hz output (melonDS patch 0180), written at the quit
+     std::string tap_path_;
+     Config cfg_;
+diff --git a/bananads/src/ffmusic.h b/bananads/src/ffmusic.h
+new file mode 100644
+index 0000000..d448b36
+--- /dev/null
++++ b/bananads/src/ffmusic.h
+@@ -0,0 +1,56 @@
++// kms.ff_music: the sound clock while fast-forwarding (melonDS patch 0500, Emu::set_sound_clock). The game runs N
++// times as fast; the ARM7's timers and the SPU run at 1/N of its time, so the music and the sound effects keep
++// their tempo and pitch and the SPU makes about real time's worth of sound. N is what the game reaches (measured
++// from the frames' times against the pacer's period; Max, or a game the handheld can't run at the speed asked, is
++// slower than asked), nudged by the sound thread's backlog against its target: more queued than the target, a
++// little less sound per frame; less, a little more. Only the amount per frame changes: the sequencer and the SPU
++// are on the same clock, so what plays keeps its tempo and pitch whatever the nudge.
++#pragma once
++#include <algorithm>
++#include <cmath>
++
++namespace bananads {
++
++class FfMusic {
++public:
++    static constexpr double kMaxRatio = 64.0;  // the sound clock's lowest rate is 1/64 (NDS::SetSoundClockRate)
++
++    double rate() const { return sent_; }  // the sound clock to set: 1 / the ratio
++
++    // fast-forward on at `speed` (2, 3, or 99 for Max)
++    void start(int speed) {
++        nominal_ = speed >= 99 ? kMaxRatio : std::max(1, speed);
++        measured_ = std::min(nominal_, 3.0);  // (Max: a first guess; the frames' times take over within ~0.1 s)
++        last_us_ = 0;
++        sent_ = 0;
++    }
++
++    // each frame while fast-forwarding, before it runs: now, the pacer's period at normal speed (us), the sound
++    // queued and its target (stereo frames; target 0: no servo, no nudge). True when rate() moved enough to set
++    bool frame(long long now_us, double period_us, int backlog, int target) {
++        if (last_us_) {
++            const long long dt = now_us - last_us_;
++            // (a pause, a menu or a state's save or load: not the game's speed)
++            if (dt > 0 && dt < 500000) measured_ += (period_us / (double)dt - measured_) * 0.1;
++        }
++        last_us_ = now_us;
++        double ratio = std::min(nominal_, measured_);
++        if (target > 0) {
++            const double err = std::clamp((double)(backlog - target) / target, -1.0, 1.0);
++            ratio *= 1.0 + 0.25 * err;
++        }
++        ratio = std::clamp(ratio, 1.0, kMaxRatio);
++        const double want = 1.0 / ratio;
++        // (changes below 0.4% wait: each one is a full Mix for FastMix, and the SPU's count per Mix moves in
++        // steps of 1/512 anyway)
++        if (sent_ > 0 && std::fabs(want - sent_) < 0.004 * sent_) return false;
++        sent_ = want;
++        return true;
++    }
++
++private:
++    double nominal_ = 2.0, measured_ = 2.0, sent_ = 0;
++    long long last_us_ = 0;
++};
++
++}  // namespace bananads
+diff --git a/bananads/src/frontend.h b/bananads/src/frontend.h
+index ed0fe54..74ded18 100644
+--- a/bananads/src/frontend.h
++++ b/bananads/src/frontend.h
+@@ -31,6 +31,8 @@ void alsa_ui_load(Alsa* a, int id, const int16_t* pcm, int frames, int rate, int
+ void alsa_ui_play(Alsa* a, int id);
+ void alsa_stop(Alsa* a);
+ void alsa_mute(Alsa* a, bool on);
++// the backlog the rate servo holds (audio.servo_target, stereo frames), or 0 without the servo (audio.servo=off)
++int alsa_servo_target(const Alsa* a);
+ // (kms.lowlat_trace) the sound thread's backlog (stereo frames queued ahead of ALSA, the stretch's included) and tempo x 1000
+ extern std::atomic<int> g_audio_backlog, g_audio_tempo;  // the game's sound faded out (fast-forward: sped-up sound is chopped noise), or back
+ #endif
+diff --git a/bananads/src/frontend_kms.cpp b/bananads/src/frontend_kms.cpp
+index cf5da3c..2cc8cd2 100644
+--- a/bananads/src/frontend_kms.cpp
++++ b/bananads/src/frontend_kms.cpp
+@@ -66,6 +66,7 @@
+ 
+ #include "Platform.h"
+ #include "cpugov.h"
++#include "ffmusic.h"
+ #include "ffspeed.h"
+ #include "frontend.h"
+ #ifdef BANANADS_GENGIS
+@@ -2302,6 +2303,11 @@ int run_kms(Emu& emu, const Config& cfg) {
+         for (const KmsPress& p : script) script_end = std::max(script_end, p.at + p.len);
+         if (!script.empty()) Log(LogLevel::Info, "[kms] kms.input: %zu presses, to frame %ld\n", script.size(), script_end);
+         const bool ff_mute = cfg.flag("kms.ff_mute", true);
++        // kms.ff_music (on): while fast-forwarding, the music and the sound effects at their own speed and pitch (the
++        // sound clock, ffmusic.h), not faded out (kms.ff_mute) or sped up. A DS only: a DSi's sound isn't on it
++        [[maybe_unused]] const bool ff_music = cfg.flag("kms.ff_music", true) && !emu.is_dsi();
++        bool music_on = false;  // the sound clock follows the fast-forward now
++        [[maybe_unused]] FfMusic ffm;
+         // kms.lowlat: the deadline the next frame aims at (0: none yet), and kms.lowlat_pad_us on top of the frames'
+         // measured times (decaying maxima, Display::emu_us and pres_us)
+         long long aim = 0;
+@@ -2360,9 +2366,14 @@ int run_kms(Emu& emu, const Config& cfg) {
+                 ff = f;
+                 pace.set_speed(ff ? ff : 1);  // (Max: 99 times as often, i.e. no wait at all in practice)
+ #ifdef BANANADS_ALSA
+-                alsa_mute(snd, ff && ff_mute);  // kms.ff_mute (on): no chopped sound while fast-forwarding
++                music_on = ff && ff_music;
++                if (music_on) ffm.start(ff);
++                else emu.set_sound_clock(1.0);  // (the hardware's clock again: the sound goes on where it was)
++                // kms.ff_mute (on): no chopped sound while fast-forwarding, unless kms.ff_music keeps it at its speed
++                alsa_mute(snd, ff && ff_mute && !music_on);
+ #endif
+-                Log(LogLevel::Info, "[kms] fast-forward %s\n", ff ? (ff == 99 ? "max" : ff == 2 ? "2x" : "3x") : "off");
++                Log(LogLevel::Info, "[kms] fast-forward %s%s\n", ff ? (ff == 99 ? "max" : ff == 2 ? "2x" : "3x") : "off",
++                    music_on ? ", the music at its own speed (kms.ff_music)" : "");
+             }
+             if (!script.empty() && emu_frames <= script_end) {
+                 uint32_t keys = 0;
+@@ -2428,6 +2439,12 @@ int run_kms(Emu& emu, const Config& cfg) {
+                 else if (on16) emu.draw_into(dp.map16(0, s), dp.map16(1, s));
+                 else emu.draw_into(dp.map(0, s), dp.map(1, s));
+             }
++#ifdef BANANADS_ALSA
++            // kms.ff_music: the sound clock for this frame, from the speed reached and the sound queued
++            if (music_on && ffm.frame(t_start, period.count() / 1000.0, g_audio_backlog.load(std::memory_order_relaxed),
++                                      alsa_servo_target(snd)))
++                emu.set_sound_clock(ffm.rate());
++#endif
+             if (!emu_frames++) start_mark("first frame: start");
+             emu.run_frame();
+             if (ra_n && emu_frames > 60) {   // (not the load's first frames; a stall isn't a frame's cost)
+diff --git a/bananads/tests/tests.cpp b/bananads/tests/tests.cpp
+index aaad76b..6dff063 100644
+--- a/bananads/tests/tests.cpp
++++ b/bananads/tests/tests.cpp
+@@ -7,6 +7,7 @@
+ #include <vector>
+ 
+ #include "config.h"
++#include "ffmusic.h"
+ #include "ffspeed.h"
+ #include "mic.h"
+ #include "wifi.h"
+@@ -194,12 +195,70 @@ static void test_ff_speed() {
+     CHECK(ff_speed_of("fast") == 2);
+ }
+ 
++// kms.ff_music's sound clock (ffmusic.h): frames n times as fast as the pacer's period give 1/n, the backlog's nudge
++// goes the right way, a pause doesn't count, Max follows the speed reached, and small moves aren't sent
++static void test_ff_music() {
++    const double period = 16715.18;  // us, a DS frame
++    auto run = [&](FfMusic& m, int speed, double reached, int backlog, int target, int frames, long long& t) {
++        m.start(speed);
++        for (int i = 0; i < frames; i++) {
++            m.frame(t, period, backlog, target);
++            t += std::llround(period / reached);
++        }
++    };
++    long long t = 1000000;
++    {
++        FfMusic m;  // 2x reached, the backlog on its target: 1/2
++        run(m, 2, 2.0, 2880, 2880, 300, t);
++        CHECK(std::fabs(m.rate() - 0.5) < 0.5 * 0.005);
++    }
++    {
++        FfMusic m;  // 3x asked, 1.5x reached (a heavy game): the speed reached, 1/1.5
++        run(m, 3, 1.5, 2880, 2880, 600, t);
++        CHECK(std::fabs(m.rate() - 1 / 1.5) < (1 / 1.5) * 0.01);
++    }
++    {
++        FfMusic m;  // Max reaching 4.5x: 1/4.5
++        run(m, 99, 4.5, 2880, 2880, 600, t);
++        CHECK(std::fabs(m.rate() - 1 / 4.5) < (1 / 4.5) * 0.01);
++    }
++    {
++        FfMusic hi, lo;  // too much queued: less sound per frame (a lower rate); too little: more
++        run(hi, 2, 2.0, 2 * 2880, 2880, 300, t);
++        run(lo, 2, 2.0, 0, 2880, 300, t);
++        CHECK(hi.rate() < 0.5 && hi.rate() > 0.5 / 1.3);
++        CHECK(lo.rate() > 0.5 && lo.rate() < 0.5 / 0.7);
++    }
++    {
++        FfMusic m;  // no servo (target 0): the speed alone; never above 1 (the game below full speed)
++        run(m, 2, 0.8, 0, 0, 300, t);
++        CHECK(m.rate() > 0.995 && m.rate() <= 1.0);  // (within the 0.4% it doesn't send)
++    }
++    {
++        FfMusic m;  // a 2 s pause (the menu) isn't a speed: still 1/2 after it
++        run(m, 2, 2.0, 2880, 2880, 300, t);
++        t += 2000000;
++        m.frame(t, period, 2880, 2880);
++        CHECK(std::fabs(m.rate() - 0.5) < 0.5 * 0.005);
++        // ...and a move under 0.4% isn't sent
++        t += std::llround(period / 2.0);
++        CHECK(!m.frame(t, period, 2880 + 20, 2880));
++    }
++    {
++        FfMusic m;  // the first frame sends a rate at once
++        m.start(2);
++        CHECK(m.frame(t, period, 2880, 2880));
++        CHECK(m.rate() > 0 && m.rate() <= 1.0);
++    }
++}
++
+ int main() {
+     test_config();
+     test_wifi_names();
+     test_dns_frames();
+     test_mic();
+     test_ff_speed();
++    test_ff_music();
+     if (fails) {
+         fprintf(stderr, "%d check(s) failed\n", fails);
+         return 1;
+-- 
+2.49.0.windows.1
+

@@ -141,6 +141,10 @@ handhelds themselves.
   (`buildroot/patches/bananads/0010-*`, #55, #52): a DS button, or a job (the menu, swap the screens, save or load slot
   1, fast-forward held or on/off, a screenshot, a blow on the mic while held, nothing). L2, R2, L3 and R3's come from
   Settings > Nintendo DS > Buttons (below); the others are the pad as printed unless bananads.conf says otherwise.
+- **Fast-forward sound** (`buildroot/patches/bananads/0500-*`): with `kms.ff_music = on` (the default; Settings >
+  Nintendo DS > BananaDS > Fast-forward sound) the game runs fast while its music and sound effects keep their own
+  tempo and pitch: the DS's ARM7 timers and sound chip run on a clock of their own at 1/N of the game's time (BananaDS's
+  melonDS patch 0500, docs/SETTINGS.md). `off`: the sound fades out while fast-forwarding, as before. DS games only.
 - **In-game menu**: F or HOME (or a button set to Menu) pauses the game and opens SuperDrastic's menu, in BananaOS's colours, on both panels: Resume,
   Save and Load (8 slots with their pictures; a load can be undone), Quick settings (volume and brightness the way
   bananad keeps them, the microphone's meter and a blow), Restart game, Quit game. Touch works on it too.
