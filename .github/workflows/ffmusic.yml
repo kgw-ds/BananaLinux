@@ -1,0 +1,154 @@
+# This fork's own build: every BananaOS release, plus BananaDS's fast-forward music (ffmusic/*.patch), for the
+# RG DS Plus, released here as ffmusic-<tag> with the files the handheld's updater wants
+# (banana-rgds-plus-<version>.update.tar and SHA256SUMS-rgds-plus.txt). The system it builds asks this fork's
+# releases for updates (system/rootfs/usr/libexec/banana/update's FEED), so a handheld running one gets the next
+# over Wi-Fi: Settings > System > Updates.
+#
+# Every 6 hours it looks at JorreFog/BananaLinux's newest release and builds it once. Run it by hand for another tag
+# or to build one again (force). A patch that no longer applies fails the run before the hour-long build.
+name: ffmusic
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "BananaLinux release tag (empty: the newest release)"
+        required: false
+        default: ""
+      force:
+        description: "Build and release again even if ffmusic-<tag> exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ffmusic
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: JorreFog/BananaLinux
+  BOARD: rgds-plus
+
+jobs:
+  find:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.f.outputs.tag }}
+      prerelease: ${{ steps.f.outputs.prerelease }}
+      build: ${{ steps.f.outputs.build }}
+    steps:
+      - id: f
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/$UPSTREAM/releases?per_page=10" --jq '[.[] | select(.draft | not)][0].tag_name')
+          fi
+          [ -n "$TAG" ] || { echo "no release found upstream"; exit 1; }
+          PRE=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq .prerelease)
+          BUILD=true
+          if gh release view "ffmusic-$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 && [ "$FORCE" != true ]; then
+            BUILD=false
+            echo "ffmusic-$TAG is already released: nothing to do"
+          fi
+          echo "upstream $TAG (prerelease: $PRE), build: $BUILD"
+          { echo "tag=$TAG"; echo "prerelease=$PRE"; echo "build=$BUILD"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: find
+    if: needs.find.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      TAG: ${{ needs.find.outputs.tag }}
+      BR2_DL_DIR: ${{ github.workspace }}/src/dl
+    steps:
+      - name: This fork's patches
+        uses: actions/checkout@v4
+        with:
+          path: fork
+          sparse-checkout: ffmusic
+      - name: BananaLinux at the release, with the patches
+        run: |
+          git clone --depth 1 --branch "$TAG" "https://github.com/$UPSTREAM.git" src
+          cd src
+          git -c user.name=ffmusic -c user.email=ffmusic@localhost am -3 ../fork/ffmusic/*.patch
+          # updates from this fork's releases (the ffmusic builds) instead of upstream's
+          F=system/rootfs/usr/libexec/banana/update
+          sed -i "s#api.github.com/repos/$UPSTREAM/releases#api.github.com/repos/$GITHUB_REPOSITORY/releases#" $F
+          grep -q "repos/$GITHUB_REPOSITORY/releases" $F || { echo "the updater's feed line moved: update this workflow"; exit 1; }
+          sh -n $F
+          echo "VERSION: $(cat VERSION)"
+      - name: The BananaDS and melonDS patches apply (before the long build)
+        run: |
+          cd src
+          V=$(sed -n 's/^BANANADS_VERSION *= *//p' buildroot/package/bananads/bananads.mk)
+          M=$(sed -n 's/^BANANADS_MELONDS_VERSION *= *//p' buildroot/package/bananads/bananads.mk)
+          mkdir -p "$RUNNER_TEMP/sd" && cd "$RUNNER_TEMP/sd"
+          git init -q && git fetch -q --depth 1 https://github.com/JorreFog/SuperDrastic.git "$V" && git checkout -q FETCH_HEAD
+          for p in "$GITHUB_WORKSPACE"/src/buildroot/patches/bananads/*.patch; do echo "BananaDS: $(basename $p)"; patch -p1 -s --no-backup-if-mismatch < "$p"; done
+          mkdir -p "$RUNNER_TEMP/mel" && cd "$RUNNER_TEMP/mel"
+          curl -fsSL "https://github.com/melonDS-emu/melonDS/archive/$M.tar.gz" | tar -xz --strip-components=1
+          for p in "$RUNNER_TEMP"/sd/bananads/patches/melonds/*.patch; do patch -p1 -s --no-backup-if-mismatch < "$p"; done
+          grep -q SetSoundClockRate src/NDS.cpp
+          echo "all patches apply"
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - name: Packages
+        run: sudo apt-get update && sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev unzip rsync cpio file wget python3-dev swig libgnutls28-dev
+      - name: Restore downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: src/dl
+          key: ffmusic-dl-${{ hashFiles('src/buildroot/configs/*', 'src/buildroot/package/**') }}
+          restore-keys: ffmusic-dl-
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.buildroot-ccache
+          key: ffmusic-ccache-${{ github.run_id }}
+          restore-keys: ffmusic-ccache-
+      - name: Build
+        run: make -C src $BOARD
+      - name: Save downloads
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: src/dl
+          key: ffmusic-dl-${{ hashFiles('src/buildroot/configs/*', 'src/buildroot/package/**') }}-${{ github.run_id }}
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.buildroot-ccache
+          key: ffmusic-ccache-${{ github.run_id }}
+      - name: Build log on failure
+        if: failure()
+        run: ls -t src/output/$BOARD/build 2>/dev/null | head -5
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRE: ${{ needs.find.outputs.prerelease }}
+        run: |
+          cd src/output/$BOARD/images
+          PKG=$(ls banana-$BOARD-*.update.tar | head -n 1)
+          [ -n "$PKG" ] || { echo "no update package was built"; exit 1; }
+          sha256sum "$PKG" > SHA256SUMS-$BOARD.txt
+          cat SHA256SUMS-$BOARD.txt
+          VER=${PKG#banana-$BOARD-}; VER=${VER%.update.tar}
+          FLAG=""; [ "$PRE" = true ] && FLAG=--prerelease
+          gh release delete "ffmusic-$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "ffmusic-$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $FLAG \
+            --title "BananaOS $VER + fast-forward music" \
+            --notes "BananaOS $TAG ($UPSTREAM) for the RG DS Plus, with BananaDS's fast-forward music (Settings > Nintendo DS > BananaDS > Fast-forward sound). Updates for a handheld running this build come from this fork's releases.
+
+          Install: put $PKG in banana/updates/ on the card, then Settings > System > Updates. Back: Updates > Previous version." \
+            "$PKG" "SHA256SUMS-$BOARD.txt"
